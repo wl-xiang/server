@@ -1,4 +1,6 @@
 logs/
 *.pid
+.*.pid.lock
 .server.lock
 .env
+__pycache__/
