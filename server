@@ -1,302 +1,709 @@
 #!/bin/sh
-# Server Manager - background service management script
-# Compatible with both sh and bash interpreters.
+# =============================================================================
+# Server Manager - background service management script.
+# POSIX sh compatible (dash / bash / busybox ash).
+#
+# Commands: start | stop | shutdown | status | logs | restart | clean | help
+# =============================================================================
 
-# ------------------------------------------------------------------------------
-# Bootstrap: resolve script directory and load .env if present.
-# ------------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# -----------------------------------------------------------------------------
+# Bootstrap: resolve the real script directory (following symlinks) so that
+# .env, logs and state files stay next to the script even when the script is
+# invoked through a symlink on PATH.
+# -----------------------------------------------------------------------------
+_resolve_script_dir() {
+    _rsd_path=$1
+    if command -v readlink >/dev/null 2>&1; then
+        _rsd_hops=0
+        while [ -L "${_rsd_path}" ] && [ "${_rsd_hops}" -lt 40 ]; do
+            _rsd_link=$(readlink "${_rsd_path}" 2>/dev/null) || break
+            case "${_rsd_link}" in
+                /*) _rsd_path=${_rsd_link} ;;
+                *)  _rsd_path="$(dirname "${_rsd_path}")/${_rsd_link}" ;;
+            esac
+            _rsd_hops=$((_rsd_hops + 1))
+        done
+    fi
+    cd "$(dirname "${_rsd_path}")" 2>/dev/null && pwd
+}
 
-# Load KEY=VALUE entries from a .env file and export them literally.
-# Empty lines and comment lines (starting with '#') are skipped. A single
-# pair of surrounding single or double quotes around the value is stripped.
-# Leading/trailing whitespace is trimmed. Values are treated as literal text
-# (no shell expansion).
+SCRIPT_DIR=$(_resolve_script_dir "$0") || {
+    printf 'Error: cannot resolve the script directory\n' >&2
+    exit 1
+}
+
+TAB=$(printf '\t')
+CR=$(printf '\r')
+
+# -----------------------------------------------------------------------------
+# .env loader.
+#
+# Syntax supported:
+#   KEY=VALUE
+#   KEY="VALUE" / KEY='VALUE'   (surrounding quotes are stripped)
+#   leading/trailing whitespace around KEY and VALUE is ignored
+#   full-line comments and (for unquoted values) trailing " # comment"
+#   CRLF line endings
+# Values are literal: no shell expansion is performed. Multi-line values are
+# not supported. Variables already set to a non-empty value in the shell
+# environment are NOT overridden by .env (shell > .env).
+# -----------------------------------------------------------------------------
 load_env() {
-    _env_file="$1"
-    _dq='"'
-    _sq="'"
-    [ -f "${_env_file}" ] || return 0
-    while IFS= read -r _line || [ -n "${_line}" ]; do
-        case "${_line}" in
+    _le_file=$1
+    [ -f "${_le_file}" ] || return 0
+    while IFS= read -r _le_line || [ -n "${_le_line}" ]; do
+        _le_line=${_le_line%"${CR}"}
+        # Trim leading whitespace (spaces, tabs, ...).
+        _le_line=${_le_line#"${_le_line%%[![:space:]]*}"}
+        case "${_le_line}" in
             ''|'#'*) continue ;;
-        esac
-        case "${_line}" in
             *=*) ;;
             *) continue ;;
         esac
-        _key="${_line%%=*}"
-        _val="${_line#*=}"
-        # Trim leading whitespace from key/value.
-        _key="${_key#"${_key%%[! ]*}"}"
-        _val="${_val#"${_val%%[! ]*}"}"
-        # Trim trailing whitespace from key/value.
-        _key="${_key%"${_key##*[! ]}"}"
-        _val="${_val%"${_val##*[! ]}"}"
-        case "${_val}" in
-            "${_dq}"*"${_dq}") _val="${_val#"${_dq}"}"; _val="${_val%"${_dq}"}" ;;
-            "${_sq}"*"${_sq}") _val="${_val#"${_sq}"}"; _val="${_val%"${_sq}"}" ;;
+        _le_key=${_le_line%%=*}
+        _le_val=${_le_line#*=}
+        # Trim key/value on both sides.
+        _le_key=${_le_key%"${_le_key##*[![:space:]]}"}
+        _le_val=${_le_val#"${_le_val%%[![:space:]]*}"}
+        _le_val=${_le_val%"${_le_val##*[![:space:]]}"}
+        # Reject unsafe / malformed keys before exporting anything.
+        case "${_le_key}" in
+            ''|*[!A-Za-z0-9_]*|[0-9]*) continue ;;
         esac
-        case "${_key}" in
-            ''|*[!A-Za-z0-9_]*) continue ;;
-            [0-9]*) continue ;;
+        # Strip a trailing comment. For unquoted values a "#" preceded by
+        # whitespace starts a comment:
+        #   KEY=value # comment   -> KEY=value
+        # Values that contain a "#" inside quoted shell syntax are kept as-is.
+        case "${_le_val}" in
+            \"*|\'*) ;;
+            *'"'*|*"'"*) ;;
+            *" #"*)     _le_val=${_le_val%%" #"*} ;;
+            *"${TAB}#"*) _le_val=${_le_val%%"${TAB}#"*} ;;
         esac
-        export "${_key}=${_val}"
-    done < "${_env_file}"
+        _le_val=${_le_val%"${_le_val##*[![:space:]]}"}
+        # Strip one pair of surrounding quotes. Anything after the closing
+        # quote (whitespace and/or a trailing comment) is discarded.
+        case "${_le_val}" in
+            \"*) _le_val=${_le_val#\"}; _le_val=${_le_val%\"*} ;;
+            \'*) _le_val=${_le_val#\'}; _le_val=${_le_val%\'*} ;;
+        esac
+        # Do not override a non-empty value coming from the shell environment.
+        eval "_le_existing=\${${_le_key}-}"
+        if [ -n "${_le_existing}" ]; then
+            unset _le_existing
+            continue
+        fi
+        unset _le_existing
+        export "${_le_key}=${_le_val}"
+    done < "${_le_file}"
 }
 
 load_env "${SCRIPT_DIR}/.env"
 
-# ------------------------------------------------------------------------------
-# Configuration with defaults (log config defaults are mandatory).
-# ------------------------------------------------------------------------------
-LOG_DIR="${LOG_DIR:-logs}"
-# Anchor a relative LOG_DIR to the script directory for stable behavior.
-case "${LOG_DIR}" in
-    /*) ;;
-    *)  LOG_DIR="${SCRIPT_DIR}/${LOG_DIR}" ;;
-esac
+# -----------------------------------------------------------------------------
+# Configuration (everything is overridable through the environment / .env).
+# -----------------------------------------------------------------------------
+# Absolute paths for LOG_DIR and STATE_DIR are used as-is; relative ones are
+# anchored to the script directory for stable behavior.
+_anchor_path() {
+    case "$1" in
+        /*) _ap_path=$1 ;;
+        *)  _ap_path="${SCRIPT_DIR}/$1" ;;
+    esac
+    # Normalize paths that already exist (removes "./" and ".." segments).
+    if [ -d "${_ap_path}" ]; then
+        ( cd "${_ap_path}" 2>/dev/null && pwd )
+    else
+        printf '%s\n' "${_ap_path}"
+    fi
+}
 
-LOG_FILE_NAME="${LOG_FILE_NAME:-server.log}"
-LOG_MAX_BACKUPS="${LOG_MAX_BACKUPS:-2}"
-# Seconds to wait for the service to initialize before considering it started.
-START_WAIT="${START_WAIT:-1}"
-PID_FILE="${SCRIPT_DIR}/server.pid"
-LOCK_FILE="${SCRIPT_DIR}/.server.lock"
+LOG_DIR=$(_anchor_path "${LOG_DIR:-logs}")
+LOG_FILE_NAME=${LOG_FILE_NAME:-server.log}
+LOG_MAX_BACKUPS=${LOG_MAX_BACKUPS:-2}
+
+# Directory used for the PID file and the lock file.
+STATE_DIR=$(_anchor_path "${STATE_DIR:-.}")
+PID_FILE_NAME=${PID_FILE_NAME:-server.pid}
+
+# Working directory for the service and the hooks. Defaults to the script
+# directory so that relative START_COMMAND values behave consistently no
+# matter where the script is invoked from.
+WORK_DIR=$(_anchor_path "${WORK_DIR:-.}")
+
+# Seconds to wait for the service to become ready after it is spawned.
+START_WAIT=${START_WAIT:-1}
+# Seconds to wait for the service to exit after SIGTERM before escalating.
+STOP_TIMEOUT=${STOP_TIMEOUT:-30}
+# Optional timeout (seconds) applied to hook commands; 0 disables it.
+HOOK_TIMEOUT=${HOOK_TIMEOUT:-0}
+# Optional readiness/health command (exit status 0 means healthy).
+HEALTH_COMMAND=${HEALTH_COMMAND:-}
+
 LOG_FILE="${LOG_DIR}/${LOG_FILE_NAME}"
+PID_FILE="${STATE_DIR}/${PID_FILE_NAME}"
+LOCK_FILE="${STATE_DIR}/.${PID_FILE_NAME}.lock"
 
-# Capture environment values (highest priority, may come from .env or shell).
-# DESIGN DECISION: Environment variables take precedence over command line
-# options. This allows .env to serve as a persistent override layer while
-# CLI options act as a fallback for ad-hoc invocations.
-ENV_START_COMMAND="${START_COMMAND:-}"
-ENV_BEFORE_COMMAND="${BEFORE_COMMAND:-}"
-ENV_AFTER_COMMAND="${AFTER_COMMAND:-}"
+# Capture environment values before parsing the command line.
+ENV_START_COMMAND=${START_COMMAND:-}
+ENV_BEFORE_COMMAND=${BEFORE_COMMAND:-}
+ENV_AFTER_COMMAND=${AFTER_COMMAND:-}
 
-# Placeholders filled by command line parsing.
+# Command line placeholders (higher priority than the environment).
 CLI_START_COMMAND=""
 CLI_BEFORE_COMMAND=""
 CLI_AFTER_COMMAND=""
 
-# ------------------------------------------------------------------------------
-# Output helpers: unified English text, portable printf-based coloring.
-# Escape codes are embedded directly in the printf format string so they are
-# interpreted by printf, while user text is passed as %s arguments to avoid
-# format string injection (shellcheck SC2059).
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Output helpers. Colors are only emitted on a TTY (NO_COLOR and TERM=dumb are
+# honored) so that logs/CI output stay clean.
+# -----------------------------------------------------------------------------
+_color_stdout=0
+_color_stderr=0
+if [ -t 1 ]; then _color_stdout=1; fi
+if [ -t 2 ]; then _color_stderr=1; fi
+if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = "dumb" ]; then
+    _color_stdout=0
+    _color_stderr=0
+fi
+
+C_RST_OUT=''
+C_RST_ERR=''
+C_OK=''
+C_WARN=''
+C_ERR=''
+if [ "${_color_stdout}" = 1 ]; then
+    C_RST_OUT='\033[0m'
+    C_OK='\033[0;32m'
+    C_WARN='\033[0;33m'
+fi
+if [ "${_color_stderr}" = 1 ]; then
+    C_RST_ERR='\033[0m'
+    C_ERR='\033[0;31m'
+fi
+
 print_info()    { printf '%s\n' "$*"; }
-print_success() { printf '\033[0;32m%s\033[0m\n' "$*"; }
-print_error()   { printf '\033[0;31m%s\033[0m\n' "$*" >&2; }
-print_warn()    { printf '\033[0;33m%s\033[0m\n' "$*"; }
+print_success() { printf '%b%s%b\n' "${C_OK}" "$*" "${C_RST_OUT}"; }
+print_warn()    { printf '%b%s%b\n' "${C_WARN}" "$*" "${C_RST_OUT}"; }
+print_error()   { printf '%b%s%b\n' "${C_ERR}" "$*" "${C_RST_ERR}" >&2; }
 
-# ------------------------------------------------------------------------------
-# Configuration validation
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+_validate_uint() {
+    case "$2" in
+        ''|*[!0-9]*)
+            print_error "Error: $1 must be a non-negative integer, got: '$2'"
+            return 1
+            ;;
+    esac
+    return 0
+}
 
-# Validate numeric configuration values. Exits with an error message on failure.
+_validate_file_name() {
+    case "$2" in
+        ''|*/*)
+            print_error "Error: $1 must be a plain file name, got: '$2'"
+            return 1
+            ;;
+        *'*'*|*'?'*|*'['*)
+            print_error "Error: $1 must not contain glob characters, got: '$2'"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 validate_config() {
-    case "${LOG_MAX_BACKUPS}" in
-        ''|*[!0-9]*)
-            print_error "Error: LOG_MAX_BACKUPS must be a non-negative integer, got: '${LOG_MAX_BACKUPS}'"
-            exit 1
-            ;;
-    esac
-    case "${START_WAIT}" in
-        ''|*[!0-9]*)
-            print_error "Error: START_WAIT must be a non-negative integer, got: '${START_WAIT}'"
-            exit 1
-            ;;
-    esac
+    _vc_bad=0
+    _validate_uint LOG_MAX_BACKUPS "${LOG_MAX_BACKUPS}" || _vc_bad=1
+    _validate_uint START_WAIT "${START_WAIT}" || _vc_bad=1
+    _validate_uint STOP_TIMEOUT "${STOP_TIMEOUT}" || _vc_bad=1
+    _validate_uint HOOK_TIMEOUT "${HOOK_TIMEOUT}" || _vc_bad=1
+    _validate_file_name LOG_FILE_NAME "${LOG_FILE_NAME}" || _vc_bad=1
+    _validate_file_name PID_FILE_NAME "${PID_FILE_NAME}" || _vc_bad=1
+    [ "${_vc_bad}" -eq 0 ]
 }
 
-# ------------------------------------------------------------------------------
-# Common helpers (shared logic, no duplication).
-# ------------------------------------------------------------------------------
-
-# Resolve final command values: environment overrides command line.
-resolve_commands() {
-    START_COMMAND="${ENV_START_COMMAND:-${CLI_START_COMMAND}}"
-    BEFORE_COMMAND="${ENV_BEFORE_COMMAND:-${CLI_BEFORE_COMMAND}}"
-    AFTER_COMMAND="${ENV_AFTER_COMMAND:-${CLI_AFTER_COMMAND}}"
+ensure_dir() {
+    [ -n "$1" ] || return 1
+    [ -d "$1" ] || mkdir -p "$1" 2>/dev/null
+    [ -d "$1" ] && [ -w "$1" ]
 }
 
-# Ensure the log directory exists. Returns the exit status of mkdir.
-ensure_log_dir() {
-    [ -d "${LOG_DIR}" ] || mkdir -p "${LOG_DIR}"
+# -----------------------------------------------------------------------------
+# Process introspection. /proc is preferred because it is race-free enough and
+# works for processes owned by other users; kill -0 is the fallback.
+# -----------------------------------------------------------------------------
+HAVE_PROC=0
+if [ -d /proc/1 ] && command -v awk >/dev/null 2>&1; then HAVE_PROC=1; fi
+
+# Read a field from /proc/PID/stat. Field numbering starts at 1 = state
+# (i.e. after the comm field, which may itself contain spaces and parentheses).
+proc_field() {
+    [ "${HAVE_PROC}" = 1 ] || return 1
+    [ -r "/proc/$1/stat" ] || return 1
+    awk -v n="$2" '{ sub(/^.*\) /, ""); print $n }' "/proc/$1/stat" 2>/dev/null
 }
 
-# Return 0 if the server is running, 1 otherwise; clean up stale pid file.
-check_pid() {
-    [ -f "${PID_FILE}" ] || return 1
-    pid="$(cat "${PID_FILE}" 2>/dev/null)"
-    [ -n "${pid}" ] || { rm -f "${PID_FILE}"; return 1; }
-    # Validate pid is a positive integer to avoid passing garbage to kill.
-    case "${pid}" in
-        ''|*[!0-9]*) rm -f "${PID_FILE}"; return 1 ;;
+process_alive() {
+    _pa_pid=$1
+    case "${_pa_pid}" in
+        ''|*[!0-9]*) return 1 ;;
     esac
-    # Reject PID 0 and PID 1 (init/systemd) to prevent accidental signals
-    # to critical system processes in case of PID file corruption or recycling.
-    [ "${pid}" -le 1 ] 2>/dev/null && { rm -f "${PID_FILE}"; return 1; }
-    if kill -0 "${pid}" 2>/dev/null; then
+    [ "${_pa_pid}" -gt 1 ] 2>/dev/null || return 1
+    if [ "${HAVE_PROC}" = 1 ]; then
+        _pa_state=$(proc_field "${_pa_pid}" 1)
+        [ -n "${_pa_state}" ] || return 1
+        # A zombie has already exited; treat it as dead so that stop does not
+        # wait forever on a process its parent never reaps.
+        [ "${_pa_state}" = "Z" ] && return 1
         return 0
     fi
-    rm -f "${PID_FILE}"
+    kill -0 "${_pa_pid}" 2>/dev/null
+}
+
+group_alive() {
+    _ga_pg=$1
+    case "${_ga_pg}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${_ga_pg}" -gt 1 ] 2>/dev/null || return 1
+    # "kill -0 -- -PGID" is not portable (dash rejects the negative operand);
+    # "-s 0" is understood by every POSIX kill implementation.
+    kill -s 0 -- "-${_ga_pg}" 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# PID file handling.
+#
+# The first line is the PID (kept for compatibility with `cat server.pid`).
+# Additional KEY=VALUE lines record the process start time (PID reuse guard),
+# the process group (so the whole tree can be signalled) and the command.
+# -----------------------------------------------------------------------------
+CUR_PID=""
+CUR_PGID=""
+CUR_PGID_VALID=0
+
+meta_get() {
+    [ -f "${PID_FILE}" ] || return 1
+    _mg_key=$1
+    while IFS= read -r _mg_line; do
+        case "${_mg_line}" in
+            "${_mg_key}="*) printf '%s\n' "${_mg_line#*=}"; return 0 ;;
+        esac
+    done < "${PID_FILE}"
     return 1
 }
 
-# Echo the recorded pid (empty if none).
-get_pid() {
-    [ -f "${PID_FILE}" ] && cat "${PID_FILE}" 2>/dev/null
-}
-
-# Acquire the start lock atomically. Returns 0 on success, 1 if another
-# instance already holds the lock or a server is already running.
-# If a stale lock file exists (leftover from a crashed previous start) and
-# no server is running, the stale lock is removed and acquisition is retried.
-acquire_start_lock() {
-    # Attempt atomic creation using noclobber.
-    if ( set -C; : > "${LOCK_FILE}" ) 2>/dev/null; then
-        : # Lock acquired successfully.
-    else
-        # Lock file exists. Determine if it is stale by checking whether a
-        # server is actually running. If not, the lock is leftover from a
-        # crashed start and can be safely removed.
-        if check_pid; then
-            return 1  # Server is running; another start should not proceed.
-        fi
-        # Stale lock detected — remove it and retry acquisition.
-        rm -f "${LOCK_FILE}"
-        if ! ( set -C; : > "${LOCK_FILE}" ) 2>/dev/null; then
-            return 1  # Could not acquire (race or permission issue).
+# Returns 0 if the recorded process is alive and still the same process that
+# was started (start-time comparison defeats PID recycling).
+check_pid() {
+    CUR_PID=""
+    CUR_PGID=""
+    CUR_PGID_VALID=0
+    [ -f "${PID_FILE}" ] || return 1
+    _cp_pid=$(head -n 1 "${PID_FILE}" 2>/dev/null)
+    case "${_cp_pid}" in
+        ''|*[!0-9]*) rm -f "${PID_FILE}" 2>/dev/null; return 1 ;;
+    esac
+    [ "${_cp_pid}" -gt 1 ] 2>/dev/null || { rm -f "${PID_FILE}" 2>/dev/null; return 1; }
+    if ! process_alive "${_cp_pid}"; then
+        rm -f "${PID_FILE}" 2>/dev/null
+        return 1
+    fi
+    _cp_start=$(meta_get start)
+    if [ -n "${_cp_start}" ]; then
+        _cp_now=$(proc_field "${_cp_pid}" 20)
+        if [ -n "${_cp_now}" ] && [ "${_cp_now}" != "${_cp_start}" ]; then
+            # PID was recycled by an unrelated process: never signal it.
+            rm -f "${PID_FILE}" 2>/dev/null
+            return 1
         fi
     fi
-    # Now that we hold the lock, verify no server is actually running.
-    if check_pid; then
-        release_start_lock
+    CUR_PID=${_cp_pid}
+    CUR_PGID=$(meta_get pgid)
+    CUR_PGID_VALID=$(meta_get pgid_valid)
+    case "${CUR_PGID_VALID}" in
+        0|1) ;;
+        *) CUR_PGID_VALID=0 ;;
+    esac
+    [ -n "${CUR_PGID}" ] || CUR_PGID_VALID=0
+    return 0
+}
+
+write_pid_file() {
+    _wp_tmp="${PID_FILE}.tmp.$$"
+    {
+        printf '%s\n' "$1"
+        printf 'start=%s\n' "$2"
+        printf 'pgid=%s\n' "$3"
+        printf 'pgid_valid=%s\n' "$4"
+        printf 'cmd=%s\n' "${CMD_SUMMARY}"
+    } > "${_wp_tmp}" 2>/dev/null || { rm -f "${_wp_tmp}"; return 1; }
+    mv -f "${_wp_tmp}" "${PID_FILE}" 2>/dev/null || { rm -f "${_wp_tmp}"; return 1; }
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Locking. The lock file stores the PID of the process holding it, so a stale
+# lock can be distinguished from a live start/stop/clean in progress.
+# -----------------------------------------------------------------------------
+LOCK_HELD=0
+LOCK_ERROR=""
+
+acquire_lock() {
+    if ! ensure_dir "${STATE_DIR}"; then
+        LOCK_ERROR="cannot create state directory '${STATE_DIR}' (check permissions)"
+        return 2
+    fi
+
+    _al_tries=0
+    while [ "${_al_tries}" -lt 3 ]; do
+        _al_tries=$((_al_tries + 1))
+        if ( set -C; printf '%s\n' "$$" > "${LOCK_FILE}" ) 2>/dev/null; then
+            LOCK_HELD=1
+            return 0
+        fi
+        if [ ! -e "${LOCK_FILE}" ]; then
+            LOCK_ERROR="cannot create lock file '${LOCK_FILE}' (check STATE_DIR permissions)"
+            return 2
+        fi
+        _al_owner=$(head -n 1 "${LOCK_FILE}" 2>/dev/null)
+        case "${_al_owner}" in
+            ''|*[!0-9]*) _al_owner="" ;;
+        esac
+        if [ -z "${_al_owner}" ]; then
+            # The lock may have been observed between creation and the owner
+            # write; give the owner a chance before declaring it stale.
+            sleep 1
+            _al_owner=$(head -n 1 "${LOCK_FILE}" 2>/dev/null)
+            case "${_al_owner}" in
+                ''|*[!0-9]*) _al_owner="" ;;
+            esac
+        fi
+        if [ -n "${_al_owner}" ] && process_alive "${_al_owner}"; then
+            LOCK_ERROR="another operation is already in progress (pid ${_al_owner})"
+            return 1
+        fi
+        rm -f "${LOCK_FILE}" 2>/dev/null
+    done
+    LOCK_ERROR="cannot acquire lock file '${LOCK_FILE}'"
+    return 1
+}
+
+release_lock() {
+    [ "${LOCK_HELD}" = 1 ] || return 0
+    _rl_owner=$(head -n 1 "${LOCK_FILE}" 2>/dev/null)
+    if [ "${_rl_owner}" = "$$" ]; then
+        rm -f "${LOCK_FILE}" 2>/dev/null
+    fi
+    LOCK_HELD=0
+}
+
+# -----------------------------------------------------------------------------
+# Signals / liveness helpers for the service process tree.
+# -----------------------------------------------------------------------------
+signal_target() {
+    _sg_sig=$1
+    _sg_pid=$2
+    _sg_pg=$3
+    _sg_pgv=$4
+    if [ "${_sg_pgv}" = 1 ] && [ -n "${_sg_pg}" ]; then
+        kill -s "${_sg_sig}" -- "-${_sg_pg}" 2>/dev/null && return 0
+    fi
+    kill -s "${_sg_sig}" "${_sg_pid}" 2>/dev/null
+}
+
+target_alive() {
+    _ta_pid=$1
+    _ta_pg=$2
+    _ta_pgv=$3
+    if [ "${_ta_pgv}" = 1 ] && [ -n "${_ta_pg}" ]; then
+        if process_alive "${_ta_pid}"; then return 0; fi
+        if group_alive "${_ta_pg}"; then return 0; fi
+        return 1
+    fi
+    process_alive "${_ta_pid}"
+}
+
+wait_target_gone() {
+    _wt_pid=$1
+    _wt_pg=$2
+    _wt_pgv=$3
+    _wt_max=$4
+    _wt_i=0
+    while [ "${_wt_i}" -lt "${_wt_max}" ]; do
+        if ! target_alive "${_wt_pid}" "${_wt_pg}" "${_wt_pgv}"; then
+            return 0
+        fi
+        sleep 1
+        _wt_i=$((_wt_i + 1))
+    done
+    target_alive "${_wt_pid}" "${_wt_pg}" "${_wt_pgv}" && return 1
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Log handling
+# -----------------------------------------------------------------------------
+rotate_log() {
+    [ -f "${LOG_FILE}" ] || return 0
+    if [ "${LOG_MAX_BACKUPS}" -eq 0 ] 2>/dev/null; then
+        rm -f "${LOG_FILE}" 2>/dev/null || return 1
+        return 0
+    fi
+    rm -f "${LOG_FILE}.bak.${LOG_MAX_BACKUPS}" 2>/dev/null
+    _rl_i=$((LOG_MAX_BACKUPS - 1))
+    while [ "${_rl_i}" -ge 1 ]; do
+        if [ -f "${LOG_FILE}.bak.${_rl_i}" ]; then
+            mv -f "${LOG_FILE}.bak.${_rl_i}" "${LOG_FILE}.bak.$((_rl_i + 1))" 2>/dev/null || return 1
+        fi
+        _rl_i=$((_rl_i - 1))
+    done
+    mv -f "${LOG_FILE}" "${LOG_FILE}.bak.1" 2>/dev/null || return 1
+    return 0
+}
+
+show_log_tail() {
+    [ -f "${LOG_FILE}" ] || return 0
+    print_info "Last log lines (${LOG_FILE}):"
+    tail -n 20 "${LOG_FILE}" 2>/dev/null | while IFS= read -r _slt_line; do
+        printf '  %s\n' "${_slt_line}"
+    done
+}
+
+# Run a hook command in WORK_DIR, appending its output to the log. Returns the
+# hook exit status so callers can react to failures.
+run_hook() {
+    _rh_label=$1
+    _rh_cmd=$2
+    [ -n "${_rh_cmd}" ] || return 0
+    printf '\n===== [%s hook] %s =====\n' \
+        "${_rh_label}" "$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE}"
+    if [ "${HOOK_TIMEOUT}" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
+        ( cd "${WORK_DIR}" 2>/dev/null && timeout "${HOOK_TIMEOUT}" sh -c "${_rh_cmd}" ) \
+            >> "${LOG_FILE}" 2>&1
+    else
+        ( cd "${WORK_DIR}" 2>/dev/null && sh -c "${_rh_cmd}" ) >> "${LOG_FILE}" 2>&1
+    fi
+}
+
+run_health() {
+    [ -n "${HEALTH_COMMAND}" ] || return 0
+    ( cd "${WORK_DIR}" 2>/dev/null && sh -c "${HEALTH_COMMAND}" ) >/dev/null 2>&1
+}
+
+# -----------------------------------------------------------------------------
+# Command resolution
+# -----------------------------------------------------------------------------
+# Precedence: command line > environment / .env (empty values are ignored).
+resolve_commands() {
+    START_COMMAND=${CLI_START_COMMAND:-${ENV_START_COMMAND}}
+    BEFORE_COMMAND=${CLI_BEFORE_COMMAND:-${ENV_BEFORE_COMMAND}}
+    AFTER_COMMAND=${CLI_AFTER_COMMAND:-${ENV_AFTER_COMMAND}}
+}
+
+# Build the script executed by the detached shell: the user command followed by
+# an exit-status recorder. Keeping the wrapper alive until the command exits
+# means the recorded PID stays valid for the whole lifetime of the service and
+# the actual exit status ends up in the log.
+build_runner() {
+    printf '%s\n' "${START_COMMAND}"
+    printf '%s\n' 'status=$?'
+    cat <<'RUNNER_EOF'
+printf "\n[manager] service exited with status %s at %s\n" "$status" "$(date "+%Y-%m-%d %H:%M:%S")" >> "$1"
+RUNNER_EOF
+}
+
+# -----------------------------------------------------------------------------
+# start
+# -----------------------------------------------------------------------------
+START_PID=""
+START_PGID=""
+START_PGID_VALID=0
+START_FAIL_REASON=""
+
+# Verify that the freshly spawned process is alive (and, when configured,
+# healthy) within the START_WAIT window. With START_WAIT=0 at least one
+# liveness check is still performed.
+verify_start() {
+    _vs_i=0
+    _vs_healthy=0
+    while :; do
+        if ! process_alive "${START_PID}"; then
+            START_FAIL_REASON="process exited during startup"
+            return 1
+        fi
+        if [ -n "${HEALTH_COMMAND}" ]; then
+            if run_health; then
+                _vs_healthy=1
+                return 0
+            fi
+        else
+            _vs_healthy=1
+        fi
+        [ "${_vs_i}" -ge "${START_WAIT}" ] && break
+        sleep 1
+        _vs_i=$((_vs_i + 1))
+    done
+    if [ "${_vs_healthy}" != 1 ]; then
+        START_FAIL_REASON="health check did not pass within ${START_WAIT}s"
         return 1
     fi
     return 0
 }
 
-# Release the start lock.
-release_start_lock() {
-    rm -f "${LOCK_FILE}"
-}
-
-# Rotate log files, keeping at most LOG_MAX_BACKUPS backups.
-# When LOG_MAX_BACKUPS is 0, the current log is deleted without creating
-# any backup files.
-rotate_log() {
-    [ -f "${LOG_FILE}" ] || return 0
-    # If no backups should be kept, simply remove the old log.
-    if [ "${LOG_MAX_BACKUPS}" -eq 0 ] 2>/dev/null; then
-        rm -f "${LOG_FILE}"
-        return 0
+# Called when the manager receives INT/TERM while a start is in progress.
+# shellcheck disable=SC2317  # invoked indirectly through a signal trap
+start_abort() {
+    _sa_code=$1
+    trap - INT TERM
+    if [ -n "${START_PID}" ]; then
+        signal_target KILL "${START_PID}" "${START_PGID}" "${START_PGID_VALID}"
+        wait_target_gone "${START_PID}" "${START_PGID}" "${START_PGID_VALID}" 3
+        rm -f "${PID_FILE}" 2>/dev/null
+        START_PID=""
     fi
-    rm -f "${LOG_FILE}.bak.${LOG_MAX_BACKUPS}"
-    i=$((LOG_MAX_BACKUPS - 1))
-    while [ "${i}" -ge 1 ]; do
-        if [ -f "${LOG_FILE}.bak.${i}" ]; then
-            mv "${LOG_FILE}.bak.${i}" "${LOG_FILE}.bak.$((i + 1))"
-        fi
-        i=$((i - 1))
-    done
-    mv "${LOG_FILE}" "${LOG_FILE}.bak.1"
+    release_lock
+    print_error "Start aborted by signal"
+    exit "${_sa_code}"
 }
 
-# Run a hook command when non-empty, sending output to the log file.
-# The command is executed via "sh -c" in a subshell so that side effects
-# (variable assignment, cd, etc.) do not leak into the parent script.
-# NOTE: Hook commands support full shell syntax by design. Ensure .env and
-# the shell environment are trusted before defining hooks.
-run_hook() {
-    [ -n "$1" ] || return 0
-    sh -c "$1" >> "${LOG_FILE}" 2>&1
-}
-
-# ------------------------------------------------------------------------------
-# Commands
-# ------------------------------------------------------------------------------
-
-do_start() {
-    resolve_commands
+start_service() {
+    START_PID=""
+    START_PGID=""
+    START_PGID_VALID=0
 
     if [ -z "${START_COMMAND}" ]; then
         print_error "Error: START_COMMAND is not defined"
-        print_info "Example:"
-        print_info "  export START_COMMAND=\"python3 /path/to/your/server.py\""
-        print_info "  Or: $0 start --command \"python3 /path/to/your/server.py\""
+        print_info "Provide it through .env, the environment, or --command:"
+        print_info "  $0 start --command \"python3 /path/to/your/server.py\""
         return 1
     fi
 
-    validate_config
-
-    if ! acquire_start_lock; then
-        print_error "Error: Server is already running or another start is in progress"
+    if ! ensure_dir "${STATE_DIR}"; then
+        print_error "Error: state directory is missing or not writable: ${STATE_DIR}"
+        print_info "Set STATE_DIR to a writable location."
+        return 1
+    fi
+    if ! ensure_dir "${LOG_DIR}"; then
+        print_error "Error: cannot create log directory: ${LOG_DIR}"
+        return 1
+    fi
+    if [ ! -d "${WORK_DIR}" ]; then
+        print_error "Error: WORK_DIR does not exist: ${WORK_DIR}"
+        return 1
+    fi
+    if ! cd "${WORK_DIR}" 2>/dev/null; then
+        print_error "Error: cannot enter WORK_DIR: ${WORK_DIR}"
         return 1
     fi
 
-    # From this point, we hold the start lock. Every failure path below must
-    # call release_start_lock before returning.
+    CMD_SUMMARY=$(printf '%s' "${START_COMMAND}" | tr '\n\t' '  ' | cut -c1-200)
 
-    if ! ensure_log_dir; then
-        release_start_lock
-        print_error "Error: Failed to create log directory: ${LOG_DIR}"
-        return 1
-    fi
-
-    rotate_log
-
-    if ! ( : > "${LOG_FILE}" ); then
-        release_start_lock
-        print_error "Error: Failed to create log file: ${LOG_FILE}"
-        return 1
-    fi
-
-    run_hook "${BEFORE_COMMAND}"
-
-    # Detach from the controlling terminal so the process survives SSH
-    # disconnect. Wrap the command in "sh -c 'exec ...'" so that spaces and
-    # quotes inside START_COMMAND are preserved correctly, and use setsid to
-    # create a new session without a controlling terminal. The inner exec
-    # replaces the shell with the actual service so $! is the service PID.
-    # Falls back to nohup where setsid is unavailable.
-    if command -v setsid >/dev/null 2>&1; then
-        setsid sh -c "exec ${START_COMMAND}" >> "${LOG_FILE}" 2>&1 < /dev/null &
-    else
-        nohup sh -c "exec ${START_COMMAND}" >> "${LOG_FILE}" 2>&1 < /dev/null &
-    fi
-    child_pid=$!
-
-    # Wait for the service to initialize, polling every second. If the
-    # process exits during this window, report failure immediately rather
-    # than waiting the full START_WAIT period.
-    wait_count=0
-    while [ "${wait_count}" -lt "${START_WAIT}" ]; do
-        sleep 1
-        if ! kill -0 "${child_pid}" 2>/dev/null; then
-            release_start_lock
-            print_error "Error: Failed to start server"
+    if rotate_log; then
+        if ! : > "${LOG_FILE}" 2>/dev/null; then
+            print_error "Error: cannot write log file: ${LOG_FILE}"
             return 1
         fi
-        wait_count=$((wait_count + 1))
-    done
+    else
+        print_warn "Warning: log rotation failed; appending to the existing log"
+        if ! : >> "${LOG_FILE}" 2>/dev/null; then
+            print_error "Error: cannot write log file: ${LOG_FILE}"
+            return 1
+        fi
+    fi
 
-    echo "${child_pid}" > "${PID_FILE}"
-    release_start_lock
+    printf '===== %s | start | command: %s =====\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${CMD_SUMMARY}" >> "${LOG_FILE}"
 
-    run_hook "${AFTER_COMMAND}"
+    if ! run_hook before "${BEFORE_COMMAND}"; then
+        print_error "Error: BEFORE_COMMAND failed; server was not started"
+        show_log_tail
+        return 1
+    fi
 
-    print_success "Server started successfully with PID ${child_pid}"
+    _ss_runner=$(build_runner)
+
+    # Install the abort handlers before spawning: an interrupt during startup
+    # must never leave an untracked service behind.
+    trap 'start_abort 130' INT
+    trap 'start_abort 143' TERM
+
+    # shellcheck disable=SC2094  # the log path is passed as an argument, not read
+    if command -v setsid >/dev/null 2>&1; then
+        setsid sh -c "${_ss_runner}" manager "${LOG_FILE}" >> "${LOG_FILE}" 2>&1 < /dev/null &
+    else
+        nohup sh -c "${_ss_runner}" manager "${LOG_FILE}" >> "${LOG_FILE}" 2>&1 < /dev/null &
+    fi
+    START_PID=$!
+
+    if [ -n "${START_PID}" ]; then
+        _ss_pg=$(proc_field "${START_PID}" 3)
+        if [ -n "${_ss_pg}" ] && [ "${_ss_pg}" = "${START_PID}" ]; then
+            START_PGID=${_ss_pg}
+            START_PGID_VALID=1
+        fi
+    fi
+
+    if [ -z "${START_PID}" ]; then
+        print_error "Error: failed to spawn the service"
+        return 1
+    fi
+
+    # Record the PID before waiting so that an interrupted manager never leaves
+    # an untracked service behind (this also closes the duplicate-start window).
+    if ! write_pid_file "${START_PID}" "$(proc_field "${START_PID}" 20)" \
+        "${START_PGID}" "${START_PGID_VALID}"; then
+        print_error "Error: cannot write PID file: ${PID_FILE}"
+        signal_target KILL "${START_PID}" "${START_PGID}" "${START_PGID_VALID}"
+        trap - INT TERM
+        return 1
+    fi
+
+    if ! verify_start; then
+        trap - INT TERM
+        print_error "Error: failed to start server (${START_FAIL_REASON})"
+        signal_target KILL "${START_PID}" "${START_PGID}" "${START_PGID_VALID}"
+        wait_target_gone "${START_PID}" "${START_PGID}" "${START_PGID_VALID}" 3
+        rm -f "${PID_FILE}" 2>/dev/null
+        START_PID=""
+        show_log_tail
+        return 1
+    fi
+
+    trap - INT TERM
+
+    if ! run_hook after "${AFTER_COMMAND}"; then
+        print_warn "Warning: AFTER_COMMAND failed (the server is running)"
+    fi
+
+    print_success "Server started successfully with PID ${START_PID}"
     print_info "Log file: ${LOG_FILE}"
     return 0
 }
 
-# Stop the server with a given signal, polling up to max_wait seconds.
-# Returns 0 on success, 1 if the process did not stop in time.
-stop_server() {
-    signal="$1"
-    max_wait="$2"
+do_start() {
+    resolve_commands
+    validate_config || return 1
+    acquire_lock
+    _ds_rc=$?
+    if [ "${_ds_rc}" -ne 0 ]; then
+        print_error "Error: ${LOCK_ERROR}"
+        return 1
+    fi
+    start_service
+    _ds_rc=$?
+    release_lock
+    return "${_ds_rc}"
+}
+
+# -----------------------------------------------------------------------------
+# stop / shutdown
+# -----------------------------------------------------------------------------
+stop_service() {
+    _sc_mode=$1
 
     if ! check_pid; then
         print_info "Server is not running"
@@ -304,184 +711,467 @@ stop_server() {
         return 0
     fi
 
-    pid="$(get_pid)"
-    if [ "${signal}" = "TERM" ]; then
-        print_info "Stopping server (PID: ${pid})..."
+    _sc_pid=${CUR_PID}
+    _sc_pg=${CUR_PGID}
+    _sc_pgv=${CUR_PGID_VALID}
+    _sc_timeout=${STOP_TIMEOUT}
+    _sc_sig="SIGTERM"
+
+    if [ "${_sc_mode}" = "force" ]; then
+        print_info "Forcefully shutting down server (PID: ${_sc_pid})..."
+        signal_target KILL "${_sc_pid}" "${_sc_pg}" "${_sc_pgv}"
+        _sc_timeout=5
+        _sc_sig="SIGKILL"
     else
-        print_info "Forcefully shutting down server (PID: ${pid})..."
+        print_info "Stopping server (PID: ${_sc_pid})..."
+        signal_target TERM "${_sc_pid}" "${_sc_pg}" "${_sc_pgv}"
     fi
 
-    kill -"${signal}" "${pid}" 2>/dev/null
-
-    count=0
-    while kill -0 "${pid}" 2>/dev/null && [ "${count}" -lt "${max_wait}" ]; do
+    _sc_i=0
+    while [ "${_sc_i}" -lt "${_sc_timeout}" ]; do
+        if ! target_alive "${_sc_pid}" "${_sc_pg}" "${_sc_pgv}"; then
+            break
+        fi
+        if [ -t 1 ]; then printf '.'; fi
         sleep 1
-        count=$((count + 1))
-        printf '.'
+        _sc_i=$((_sc_i + 1))
     done
-    printf '\n'
+    if [ -t 1 ]; then printf '\n'; fi
 
-    if kill -0 "${pid}" 2>/dev/null; then
-        print_warn "Warning: Server did not stop, still running"
+    if target_alive "${_sc_pid}" "${_sc_pg}" "${_sc_pgv}" && [ "${_sc_mode}" != "force" ]; then
+        print_warn "Warning: server did not stop after ${STOP_TIMEOUT}s, sending SIGKILL"
+        signal_target KILL "${_sc_pid}" "${_sc_pg}" "${_sc_pgv}"
+        _sc_sig="SIGKILL"
+        _sc_i=0
+        while [ "${_sc_i}" -lt 5 ]; do
+            if ! target_alive "${_sc_pid}" "${_sc_pg}" "${_sc_pgv}"; then
+                break
+            fi
+            sleep 1
+            _sc_i=$((_sc_i + 1))
+        done
+    fi
+
+    if target_alive "${_sc_pid}" "${_sc_pg}" "${_sc_pgv}"; then
+        print_error "Error: server is still running (PID: ${_sc_pid}); PID file kept"
         return 1
     fi
 
-    rm -f "${PID_FILE}"
-    if [ "${signal}" = "TERM" ]; then
-        print_success "Server stopped successfully"
-    else
+    rm -f "${PID_FILE}" 2>/dev/null
+    if [ -f "${LOG_FILE}" ]; then
+        printf '[manager] service stopped by manager (%s) at %s\n' \
+            "${_sc_sig}" "$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE}" 2>/dev/null
+    fi
+    if [ "${_sc_mode}" = "force" ]; then
         print_success "Server forcefully stopped"
+    else
+        print_success "Server stopped successfully"
     fi
     return 0
 }
 
-do_stop()     { stop_server TERM 30; }
-do_shutdown() { stop_server KILL 1; }
+do_stop() {
+    validate_config || return 1
+    acquire_lock
+    _dst_rc=$?
+    if [ "${_dst_rc}" -ne 0 ]; then
+        print_error "Error: ${LOCK_ERROR}"
+        return 1
+    fi
+    stop_service graceful
+    _dst_rc=$?
+    release_lock
+    return "${_dst_rc}"
+}
 
+do_shutdown() {
+    validate_config || return 1
+    acquire_lock
+    _dsd_rc=$?
+    if [ "${_dsd_rc}" -ne 0 ]; then
+        print_error "Error: ${LOCK_ERROR}"
+        return 1
+    fi
+    stop_service force
+    _dsd_rc=$?
+    release_lock
+    return "${_dsd_rc}"
+}
+
+# -----------------------------------------------------------------------------
+# restart
+# -----------------------------------------------------------------------------
+do_restart() {
+    resolve_commands
+    validate_config || return 1
+    if [ -z "${START_COMMAND}" ]; then
+        print_error "Error: START_COMMAND is not defined; refusing to stop the server without a command to start it again"
+        return 1
+    fi
+    acquire_lock
+    _dr_rc=$?
+    if [ "${_dr_rc}" -ne 0 ]; then
+        print_error "Error: ${LOCK_ERROR}"
+        return 1
+    fi
+
+    if check_pid; then
+        stop_service graceful
+        _dr_rc=$?
+        if [ "${_dr_rc}" -ne 0 ]; then
+            release_lock
+            print_error "Error: restart aborted because the server could not be stopped"
+            return 1
+        fi
+        sleep 1
+    else
+        print_info "Server is not running; starting it"
+    fi
+
+    start_service
+    _dr_rc=$?
+    release_lock
+    return "${_dr_rc}"
+}
+
+# -----------------------------------------------------------------------------
+# status / logs / clean
+# -----------------------------------------------------------------------------
 do_status() {
     if check_pid; then
-        printf 'Server is \033[0;32mrunning\033[0m (PID: %s)\n' "$(get_pid)"
-        exit 0
+        printf 'Server is %brunning%b (PID: %s)\n' "${C_OK}" "${C_RST_OUT}" "${CUR_PID}"
+        _st_cmd=$(meta_get cmd)
+        if [ -n "${_st_cmd}" ]; then
+            print_info "  Command: ${_st_cmd}"
+        fi
+        print_info "  Log: ${LOG_FILE}"
+        if [ -n "${HEALTH_COMMAND}" ]; then
+            if run_health; then
+                print_success "  Health: ok"
+            else
+                print_error "  Health: failed"
+                return 1
+            fi
+        fi
+        return 0
     fi
-    printf 'Server is \033[0;31mstopped\033[0m\n'
-    exit 1
+
+    print_info "Server is stopped"
+    if [ -f "${LOG_FILE}" ]; then
+        _st_last=$(grep -F 'service exited with status' "${LOG_FILE}" 2>/dev/null | tail -n 1)
+        if [ -n "${_st_last}" ]; then
+            print_info "  Last exit: ${_st_last}"
+        fi
+    fi
+    return 3
 }
 
 do_log() {
-    if [ ! -f "${LOG_FILE}" ]; then
-        print_error "Log file does not exist: ${LOG_FILE}"
-        exit 1
-    fi
-
-    lines=""
-    follow=""
+    _lg_lines=""
+    _lg_follow=0
     while [ $# -gt 0 ]; do
         case "$1" in
-            -n)
-                [ $# -ge 2 ] || { print_error "Error: -n requires an argument"; exit 1; }
-                lines="$2"; shift 2 ;;
-            -f) follow="1"; shift ;;
-            *)  shift ;;
+            -n|--lines)
+                if [ $# -lt 2 ]; then
+                    print_error "Error: $1 requires an argument"
+                    return 1
+                fi
+                _lg_lines=$2
+                shift 2
+                ;;
+            -f|--follow)
+                _lg_follow=1
+                shift
+                ;;
+            -h|--help)
+                show_usage
+                return 0
+                ;;
+            *)
+                print_error "Error: unknown option for logs: $1"
+                return 1
+                ;;
         esac
     done
 
-    if [ -n "${follow}" ] && [ -n "${lines}" ]; then
-        tail -n "${lines}" -f "${LOG_FILE}"
-    elif [ -n "${follow}" ]; then
-        tail -f "${LOG_FILE}"
-    elif [ -n "${lines}" ]; then
-        tail -n "${lines}" "${LOG_FILE}"
-    else
-        tail "${LOG_FILE}"
+    if [ -n "${_lg_lines}" ]; then
+        case "${_lg_lines}" in
+            ''|*[!0-9]*)
+                print_error "Error: -n requires a non-negative integer, got: '${_lg_lines}'"
+                return 1
+                ;;
+        esac
     fi
-}
 
-do_restart() {
-    print_info "Restarting server..."
-    if check_pid; then
-        do_stop || return 1
-        # Brief pause to allow the process to fully release resources (e.g.,
-        # listening sockets) before the new instance starts.
-        sleep 1
-    else
-        print_info "Server is not running"
-        rm -f "${PID_FILE}" 2>/dev/null
+    if [ ! -f "${LOG_FILE}" ]; then
+        print_error "Error: log file does not exist: ${LOG_FILE}"
+        return 1
     fi
-    do_start
+
+    if [ "${_lg_follow}" = 1 ]; then
+        if [ -n "${_lg_lines}" ]; then
+            tail -n "${_lg_lines}" -f "${LOG_FILE}"
+        else
+            tail -f "${LOG_FILE}"
+        fi
+    else
+        if [ -n "${_lg_lines}" ]; then
+            tail -n "${_lg_lines}" "${LOG_FILE}"
+        else
+            tail -n +1 "${LOG_FILE}"
+        fi
+    fi
 }
 
 do_clean() {
+    _cl_yes=0
+    _cl_dry=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -y|--yes)
+                _cl_yes=1
+                shift
+                ;;
+            -n|--dry-run)
+                _cl_dry=1
+                shift
+                ;;
+            -h|--help)
+                show_usage
+                return 0
+                ;;
+            *)
+                print_error "Error: unknown option for clean: $1"
+                return 1
+                ;;
+        esac
+    done
+
+    validate_config || return 1
+
+    if ! ensure_dir "${STATE_DIR}"; then
+        print_error "Error: state directory is missing or not writable: ${STATE_DIR}"
+        return 1
+    fi
+
+    acquire_lock
+    _cl_rc=$?
+    if [ "${_cl_rc}" -ne 0 ]; then
+        print_error "Error: ${LOCK_ERROR}"
+        return 1
+    fi
+
     if check_pid; then
-        print_error "Error: Server is running (PID: $(get_pid)). Stop server before cleaning logs."
-        exit 1
+        release_lock
+        print_error "Error: server is running (PID: ${CUR_PID}). Stop it before cleaning logs."
+        return 1
     fi
 
     if [ ! -d "${LOG_DIR}" ]; then
+        release_lock
         print_info "No log files to clean"
-        exit 0
+        return 0
     fi
 
-    # Build cleanup pattern from the configured LOG_FILE_NAME.
-    # Removes the main log file and all rotated backups (*.bak.N).
-    count=0
-    if [ -f "${LOG_DIR}/${LOG_FILE_NAME}" ]; then
-        count=$((count + 1))
-    fi
-    for f in "${LOG_DIR}/${LOG_FILE_NAME}".bak.*; do
-        [ -f "$f" ] && count=$((count + 1))
+    _cl_count=0
+    for _cl_file in "${LOG_FILE}" "${LOG_FILE}".bak.*; do
+        if [ -f "${_cl_file}" ]; then
+            _cl_count=$((_cl_count + 1))
+        fi
     done
 
-    if [ "${count}" -eq 0 ]; then
+    if [ "${_cl_count}" -eq 0 ]; then
+        release_lock
         print_info "No log files to clean"
-        exit 0
+        return 0
     fi
 
-    rm -f "${LOG_DIR}/${LOG_FILE_NAME}"
-    rm -f "${LOG_DIR}/${LOG_FILE_NAME}".bak.*
-    print_info "Cleaned ${count} log file(s)"
+    if [ "${_cl_dry}" = 1 ]; then
+        for _cl_file in "${LOG_FILE}" "${LOG_FILE}".bak.*; do
+            if [ -f "${_cl_file}" ]; then
+                print_info "would remove: ${_cl_file}"
+            fi
+        done
+        release_lock
+        print_info "Dry run: ${_cl_count} log file(s) would be removed"
+        return 0
+    fi
+
+    if [ "${_cl_yes}" != 1 ] && [ -t 0 ]; then
+        printf 'Delete %s log file(s) in %s? [y/N] ' "${_cl_count}" "${LOG_DIR}"
+        _cl_answer=""
+        read -r _cl_answer || _cl_answer=""
+        case "${_cl_answer}" in
+            y|Y|yes|YES) ;;
+            *)
+                release_lock
+                print_info "Aborted"
+                return 1
+                ;;
+        esac
+    fi
+
+    _cl_removed=0
+    _cl_failed=0
+    for _cl_file in "${LOG_FILE}" "${LOG_FILE}".bak.*; do
+        if [ -f "${_cl_file}" ]; then
+            if rm -f "${_cl_file}" 2>/dev/null; then
+                _cl_removed=$((_cl_removed + 1))
+            else
+                _cl_failed=$((_cl_failed + 1))
+            fi
+        fi
+    done
+
+    release_lock
+    print_info "Removed ${_cl_removed} log file(s)"
+    if [ "${_cl_failed}" -ne 0 ]; then
+        print_error "Error: failed to remove ${_cl_failed} log file(s)"
+        return 1
+    fi
+    return 0
 }
 
-# Parse start/restart command line options into the CLI_* placeholders.
-# Consumes arguments and leaves none; use after a 'shift'.
+# -----------------------------------------------------------------------------
+# Argument parsing / usage
+# -----------------------------------------------------------------------------
 parse_start_options() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -c|--command)
-                [ $# -ge 2 ] || { print_error "Error: $1 requires an argument"; show_usage; exit 1; }
-                CLI_START_COMMAND="$2"; shift 2 ;;
+                if [ $# -lt 2 ]; then
+                    print_error "Error: $1 requires an argument"
+                    show_usage
+                    return 1
+                fi
+                CLI_START_COMMAND=$2
+                shift 2
+                ;;
             -b|--before)
-                [ $# -ge 2 ] || { print_error "Error: $1 requires an argument"; show_usage; exit 1; }
-                CLI_BEFORE_COMMAND="$2"; shift 2 ;;
+                if [ $# -lt 2 ]; then
+                    print_error "Error: $1 requires an argument"
+                    show_usage
+                    return 1
+                fi
+                CLI_BEFORE_COMMAND=$2
+                shift 2
+                ;;
             -a|--after)
-                [ $# -ge 2 ] || { print_error "Error: $1 requires an argument"; show_usage; exit 1; }
-                CLI_AFTER_COMMAND="$2"; shift 2 ;;
-            *) print_error "Unknown option: $1"; show_usage; exit 1 ;;
+                if [ $# -lt 2 ]; then
+                    print_error "Error: $1 requires an argument"
+                    show_usage
+                    return 1
+                fi
+                CLI_AFTER_COMMAND=$2
+                shift 2
+                ;;
+            -h|--help)
+                show_usage
+                return 2
+                ;;
+            *)
+                print_error "Error: unknown option: $1"
+                show_usage
+                return 1
+                ;;
         esac
     done
+    return 0
 }
 
 show_usage() {
     cat <<EOF
-Usage: $0 {start|stop|shutdown|status|logs|restart|clean}
+Usage: $0 <command> [options]
 
 Commands:
-  start    Start the server in background
-  stop     Gracefully stop the server (SIGTERM)
-  shutdown Forcefully stop the server (SIGKILL)
-  status   Show server status
-  logs     View server logs (supports -n NUM and -f)
-  restart  Restart the server (accepts the same options as start)
-  clean    Clean all log files
+  start       Start the service in the background
+  stop        Gracefully stop the service (SIGTERM, escalating to SIGKILL
+              after STOP_TIMEOUT seconds)
+  shutdown    Forcefully stop the service (SIGKILL)
+  restart     Restart the service (accepts the same options as start)
+  status      Show service status
+              (exit code: 0 running, 1 unhealthy, 3 stopped)
+  logs        Show the log file (default: whole file)
+  clean       Remove log files
+  help        Show this help
 
 Start/Restart options:
-  -c, --command CMD   Set the command to start the server
-  -b, --before CMD    Set command to run before starting server
-  -a, --after CMD     Set command to run after starting server
+  -c, --command CMD   Command used to start the service
+  -b, --before CMD    Command executed before starting the service
+  -a, --after CMD     Command executed after starting the service
 
-Note: Environment variables (START_COMMAND, BEFORE_COMMAND, AFTER_COMMAND)
-      loaded from .env or the shell take precedence over command line options
-      when set and non-empty.
+Logs options:
+  -n, --lines NUM     Number of lines (default: all)
+  -f, --follow        Follow the log file
+
+Clean options:
+  -y, --yes           Do not ask for confirmation
+  -n, --dry-run       Only show what would be removed
+
+Precedence: command line > environment > .env file.
 EOF
 }
 
-# ------------------------------------------------------------------------------
-# Argument dispatch
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Global traps
+# -----------------------------------------------------------------------------
+# HUP is caught (not ignored) so the manager itself survives an SSH disconnect
+# while children still get the default disposition.
+trap ':' HUP
+trap 'release_lock' EXIT
+
+# -----------------------------------------------------------------------------
+# Dispatch
+# -----------------------------------------------------------------------------
 case "$1" in
     start)
         shift
         parse_start_options "$@"
-        do_start || exit 1
+        _dp_rc=$?
+        [ "${_dp_rc}" -eq 2 ] && exit 0
+        [ "${_dp_rc}" -eq 0 ] || exit 1
+        do_start
+        exit $?
         ;;
-    stop)     do_stop || exit 1 ;;
-    shutdown) do_shutdown || exit 1 ;;
-    status)   do_status ;;
-    logs)     shift; do_log "$@" ;;
+    stop)
+        do_stop
+        exit $?
+        ;;
+    shutdown)
+        do_shutdown
+        exit $?
+        ;;
     restart)
         shift
         parse_start_options "$@"
-        do_restart || exit 1
+        _dp_rc=$?
+        [ "${_dp_rc}" -eq 2 ] && exit 0
+        [ "${_dp_rc}" -eq 0 ] || exit 1
+        do_restart
+        exit $?
         ;;
-    clean)    do_clean ;;
-    *)        show_usage; exit 1 ;;
+    status)
+        do_status
+        exit $?
+        ;;
+    logs)
+        shift
+        do_log "$@"
+        exit $?
+        ;;
+    clean)
+        shift
+        do_clean "$@"
+        exit $?
+        ;;
+    help|-h|--help|'')
+        show_usage
+        if [ -z "$1" ]; then exit 1; fi
+        exit 0
+        ;;
+    *)
+        print_error "Error: unknown command: $1"
+        show_usage
+        exit 1
+        ;;
 esac
